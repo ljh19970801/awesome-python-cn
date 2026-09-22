@@ -1,1 +1,1052 @@
+# -*- coding: utf-8 -*-
+"""
+机器学习基础建模搭建平台 - 单文件完整实现
+基于 PyQt5 构建的桌面端自动化机器学习与建模平台
+"""
+
+import os
+import sys
+import time
+import json
+import traceback
+import tempfile
+import warnings
+from datetime import datetime
+
+import numpy as np
+import pandas as pd
+
+# PyQt5 UI 导入
+from PyQt5.QtCore import Qt, QThread, pyqtSignal
+from PyQt5.QtWidgets import (
+    QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
+    QGridLayout, QLabel, QPushButton, QComboBox, QListWidget, QAbstractItemView,
+    QTableWidget, QTableWidgetItem, QTabWidget, QTextEdit, QProgressBar,
+    QFileDialog, QMessageBox, QGroupBox, QSpinBox, QDoubleSpinBox, QCheckBox,
+    QLineEdit, QSplitter
+)
+
+# Matplotlib 中文与渲染配置
+import matplotlib
+matplotlib.use('Agg')
+import matplotlib.pyplot as plt
+plt.rcParams['font.sans-serif'] = ['SimHei', 'Arial Unicode MS', 'DejaVu Sans']
+plt.rcParams['axes.unicode_minus'] = False
+
+# Scikit-Learn 模块
+from sklearn.model_selection import train_test_split, KFold, StratifiedKFold, GridSearchCV, RandomizedSearchCV
+from sklearn.preprocessing import StandardScaler, MinMaxScaler, RobustScaler, PowerTransformer, OrdinalEncoder, OneHotEncoder
+from sklearn.impute import SimpleImputer
+from sklearn.compose import ColumnTransformer
+from sklearn.pipeline import Pipeline
+from sklearn.metrics import (
+    mean_absolute_error, mean_squared_error, r2_score, explained_variance_score,
+    accuracy_score, precision_score, recall_score, f1_score, roc_auc_score,
+    confusion_matrix, roc_curve, precision_recall_curve
+)
+from sklearn.linear_model import LogisticRegression, LinearRegression, SGDRegressor, SGDClassifier
+from sklearn.ensemble import RandomForestClassifier, RandomForestRegressor, GradientBoostingClassifier, GradientBoostingRegressor
+import joblib
+
+# 可选依赖安全导入
+try:
+    import xgboost as xgb
+    HAS_XGBOOST = True
+except ImportError:
+    HAS_XGBOOST = False
+
+try:
+    import lightgbm as lgb
+    HAS_LIGHTGBM = True
+except ImportError:
+    HAS_LIGHTGBM = False
+
+try:
+    import catboost as cb
+    HAS_CATBOOST = True
+except ImportError:
+    HAS_CATBOOST = False
+
+try:
+    from imblearn.over_sampling import SMOTE
+    HAS_IMBLEARN = True
+except ImportError:
+    HAS_IMBLEARN = False
+
+try:
+    import category_encoders as ce
+    HAS_CE = True
+except ImportError:
+    HAS_CE = False
+
+
+# ==========================================
+# 1. 核心数据解析与加载引擎
+# ==========================================
+class DataLoaderEngine:
+    @staticmethod
+    def smart_read_csv(file_path):
+        """增强型CSV读取，支持自动编码检测、BOM、NUL清理及多分隔符嗅探"""
+        encodings = ['utf-8', 'gbk', 'gb18030', 'utf-16', 'big5', 'utf-8-sig']
+        raw_bytes = None
+        
+        # 1. 读取二进制并处理 NUL 字节与编码
+        try:
+            with open(file_path, 'rb') as f:
+                raw_bytes = f.read()
+        except Exception as e:
+            raise RuntimeError(f"文件无法读取: {str(e)}")
+
+        # 检查是否包含带 BOM 的 UTF-16/32
+        detected_enc = 'utf-8'
+        for enc in encodings:
+            try:
+                raw_bytes.decode(enc)
+                detected_enc = enc
+                break
+            except UnicodeDecodeError:
+                continue
+
+        # 清理非 UTF-16 的 NUL 字节
+        if '16' not in detected_enc.lower():
+            raw_bytes = raw_bytes.replace(b'\x00', b'')
+
+        # 2. 分隔符嗅探
+        delimiters = [',', ';', '\t', '|']
+        best_sep = ','
+        max_cols = 0
+        
+        text_sample = raw_bytes[:4096].decode(detected_enc, errors='ignore')
+        for sep in delimiters:
+            lines = text_sample.splitlines()
+            if len(lines) > 0:
+                cols = len(lines[0].split(sep))
+                if cols > max_cols:
+                    max_cols = cols
+                    best_sep = sep
+
+        # 3. 尝试 pandas 读取
+        import io
+        df = None
+        last_err = None
+        for enc in [detected_enc] + encodings:
+            try:
+                df = pd.read_csv(io.BytesIO(raw_bytes), encoding=enc, sep=best_sep, engine='python')
+                break
+            except Exception as e:
+                last_err = e
+                try:
+                    df = pd.read_csv(io.BytesIO(raw_bytes), encoding=enc, sep=None, engine='python')
+                    break
+                except Exception as e2:
+                    last_err = e2
+
+        if df is None:
+            # 逐行兜底解析
+            try:
+                lines = text_sample.splitlines()
+                parsed_rows = [line.split(best_sep) for line in lines if line.strip()]
+                if parsed_rows:
+                    df = pd.DataFrame(parsed_rows[1:], columns=parsed_rows[0])
+            except Exception as line_err:
+                raise RuntimeError(f"CSV完全解析失败: {str(last_err)} | 逐行兜底失败: {str(line_err)}")
+
+        # 去除全空列
+        df = df.dropna(how='all', axis=1)
+        return df, detected_enc, best_sep
+
+    @staticmethod
+    def load_file(file_path):
+        ext = os.path.splitext(file_path)[1].lower()
+        if ext in ['.csv', '.txt']:
+            return DataLoaderEngine.smart_read_csv(file_path)
+        elif ext in ['.xls', '.xlsx']:
+            try:
+                df = pd.read_excel(file_path, engine='openpyxl')
+            except Exception:
+                with open(file_path, 'rb') as f:
+                    content = f.read()
+                import io
+                df = pd.read_excel(io.BytesIO(content))
+            return df, 'excel', 'sheet'
+        else:
+            # 默认尝试 CSV
+            return DataLoaderEngine.smart_read_csv(file_path)
+
+
+# ==========================================
+# 2. 后台训练工作线程
+# ==========================================
+class TrainWorker(QThread):
+    log_signal = pyqtSignal(str)
+    progress_signal = pyqtSignal(int)
+    finished_signal = pyqtSignal(dict)
+    error_signal = pyqtSignal(str)
+
+    def __init__(self, config):
+        super().__init__()
+        self.config = config
+        self.is_cancelled = False
+
+    def run(self):
+        try:
+            self.log_signal.emit("=== 训练任务初始化 ===")
+            df = self.config['df'].copy()
+            target_col = self.config['target_col']
+            feature_cols = self.config['feature_cols']
+            problem_type = self.config['problem_type']
+            
+            # 目标列检查
+            if target_col in df.columns:
+                initial_len = len(df)
+                df = df.dropna(subset=[target_col])
+                dropped = initial_len - len(df)
+                if dropped > 0:
+                    self.log_signal.emit(f"自动删除目标变量为空的行数: {dropped}")
+
+            X = df[feature_cols]
+            y = df[target_col]
+
+            # 自动判定问题类型
+            if problem_type == "自动检测":
+                if pd.api.types.is_numeric_dtype(y) and y.nunique() > 20:
+                    problem_type = "回归"
+                else:
+                    problem_type = "分类"
+            self.log_signal.emit(f"确定问题类型: {problem_type}")
+
+            # 大数据集自动采样
+            is_big_data = self.config.get('is_big_data', False)
+            if is_big_data and self.config.get('auto_sample', True):
+                sample_n = min(self.config.get('sample_n', 50000), len(df))
+                if sample_n < len(df):
+                    if problem_type == "分类" and y.nunique() > 1:
+                        try:
+                            df, _ = train_test_split(df, train_size=sample_n, stratify=y, random_state=self.config.get('seed', 42))
+                        except Exception:
+                            df = df.sample(n=sample_n, random_state=self.config.get('seed', 42))
+                    else:
+                        df = df.sample(n=sample_n, random_state=self.config.get('seed', 42))
+                    X = df[feature_cols]
+                    y = df[target_col]
+                    self.log_signal.emit(f"大数据集自动采样后数据量: {len(df)}")
+
+            # 数据预处理流水线搭建
+            numeric_features = X.select_dtypes(include=['int64', 'float64', 'int32', 'float32']).columns.tolist()
+            categorical_features = [c for c in feature_cols if c not in numeric_features]
+
+            # 缺失值与缩放配置
+            num_impute_strategy = self.config.get('num_impute', 'mean')
+            scale_method = self.config.get('scale_method', 'StandardScaler')
+            
+            num_transformer_steps = [('imputer', SimpleImputer(strategy='mean' if num_impute_strategy=='mean' else ('median' if num_impute_strategy=='median' else 'constant')))]
+            if scale_method == 'StandardScaler':
+                num_transformer_steps.append(('scaler', StandardScaler()))
+            elif scale_method == 'MinMaxScaler':
+                num_transformer_steps.append(('scaler', MinMaxScaler()))
+            elif scale_method == 'RobustScaler':
+                num_transformer_steps.append(('scaler', RobustScaler()))
+            elif scale_method == 'PowerTransformer':
+                num_transformer_steps.append(('scaler', PowerTransformer()))
+            
+            num_transformer = Pipeline(steps=num_transformer_steps)
+
+            cat_encode_method = self.config.get('cat_encode', '独热编码')
+            if cat_encode_method == '独热编码':
+                cat_transformer = Pipeline(steps=[
+                    ('imputer', SimpleImputer(strategy='constant', fill_value='missing')),
+                    ('onehot', OneHotEncoder(handle_unknown='ignore', sparse_output=False))
+                ])
+            elif cat_encode_method == '目标编码' and HAS_CE:
+                cat_transformer = Pipeline(steps=[
+                    ('imputer', SimpleImputer(strategy='constant', fill_value='missing')),
+                    ('target_enc', ce.TargetEncoder())
+                ])
+            else:
+                cat_transformer = Pipeline(steps=[
+                    ('imputer', SimpleImputer(strategy='constant', fill_value='missing')),
+                    ('ordinal', OrdinalEncoder(handle_unknown='use_encoded_value', unknown_value=-1))
+                ])
+
+            preprocessor = ColumnTransformer(
+                transformers=[
+                    ('num', num_transformer, numeric_features),
+                    ('cat', cat_transformer, categorical_features)
+                ], remainder='drop'
+            )
+
+            # 数据集划分
+            test_size = self.config.get('test_size', 0.2)
+            seed = self.config.get('seed', 42)
+            
+            if problem_type == "分类" and y.nunique() > 1:
+                try:
+                    X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=test_size, stratify=y, random_state=seed)
+                except Exception:
+                    X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=test_size, random_state=seed)
+            else:
+                X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=test_size, random_state=seed)
+
+            # SMOTE 过采样
+            if problem_type == "分类" and self.config.get('use_smote', False) and HAS_IMBLEARN:
+                try:
+                    # 先预处理再 SMOTE
+                    preprocessor.fit(X_train)
+                    X_train_trans = preprocessor.transform(X_train)
+                    smote = SMOTE(random_state=seed)
+                    X_train_trans, y_train = smote.fit_resample(X_train_trans, y_train)
+                    # 重建简化管道
+                    from sklearn.preprocessing import FunctionTransformer
+                    preprocessor = FunctionTransformer(func=lambda x: x, validate=False)
+                    X_train = X_train_trans
+                    self.log_signal.emit(f"SMOTE过采样完成，训练集大小: {len(X_train)}")
+                except Exception as e:
+                    self.log_signal.emit(f"SMOTE执行失败，跳过: {str(e)}")
+
+            self.log_signal.emit(f"训练集样本数: {len(X_train)}, 测试集样本数: {len(X_test)}")
+
+            # 模型定义
+            models_to_run = self.config.get('models', [])
+            results = {}
+            best_score = -999999 if problem_type == "分类" else 999999
+            best_model_name = None
+            best_pipeline = None
+
+            total_models = len(models_to_run)
+            os.makedirs(self.config['output_dir'], exist_ok=True)
+
+            for idx, m_name in enumerate(models_to_run):
+                if self.is_cancelled:
+                    self.log_signal.emit("训练已被用户取消")
+                    break
+
+                self.log_signal.emit(f"\n--- 开始训练模型: {m_name} ({idx+1}/{total_models}) ---")
+                start_t = time.time()
+
+                try:
+                    # 实例化模型
+                    model = self.get_model_instance(m_name, problem_type, seed)
+                    if model is None:
+                        self.log_signal.emit(f"模型 {m_name} 依赖未安装或不支持，跳过。")
+                        continue
+
+                    pipeline = Pipeline(steps=[('preprocessor', preprocessor), ('model', model)])
+
+                    # 调优参数
+                    tune_method = self.config.get('tune_method', '不调优')
+                    cv_folds = self.config.get('cv_folds', 5)
+                    
+                    if tune_method in ['网格搜索', '随机搜索'] and m_name in self.config.get('param_grids', {}):
+                        param_grid = self.config['param_grids'][m_name]
+                        if param_grid:
+                            scoring = 'f1_macro' if problem_type == '分类' else 'neg_root_mean_squared_error'
+                            if tune_method == '网格搜索':
+                                search = GridSearchCV(pipeline, param_grid, cv=cv_folds, scoring=scoring, n_jobs=self.config.get('n_jobs', 1))
+                            else:
+                                search = RandomizedSearchCV(pipeline, param_grid, n_iter=10, cv=cv_folds, scoring=scoring, random_state=seed, n_jobs=self.config.get('n_jobs', 1))
+                            search.fit(X_train, y_train)
+                            pipeline = search.best_estimator_
+                            self.log_signal.emit(f"{m_name} 调优完成，最佳参数: {search.best_params_}")
+                        else:
+                            pipeline.fit(X_train, y_train)
+                    else:
+                        pipeline.fit(X_train, y_train)
+
+                    train_time = time.time() - start_t
+                    
+                    # 预测与评估
+                    y_pred = pipeline.predict(X_test)
+                    metrics = self.evaluate_metrics(y_test, y_pred, pipeline, X_test, problem_type)
+                    metrics['训练时间'] = round(train_time, 2)
+                    metrics['状态'] = '成功'
+
+                    # 特征重要性提取
+                    feature_importance = self.extract_feature_importance(pipeline, feature_cols)
+                    metrics['feature_importance'] = feature_importance
+
+                    # 生成图表
+                    chart_paths = self.generate_charts(pipeline, X_test, y_test, y_pred, m_name, problem_type, self.config['output_dir'])
+                    metrics['chart_paths'] = chart_paths
+
+                    results[m_name] = {
+                        'pipeline': pipeline,
+                        'metrics': metrics
+                    }
+
+                    # 判定最佳模型
+                    if problem_type == '回归':
+                        score_val = metrics.get('RMSE', 999999)
+                        if score_val < best_score:
+                            best_score = score_val
+                            best_model_name = m_name
+                            best_pipeline = pipeline
+                    else:
+                        score_val = metrics.get('F1', 0)
+                        if score_val > best_score:
+                            best_score = score_val
+                            best_model_name = m_name
+                            best_pipeline = pipeline
+
+                    self.log_signal.emit(f"模型 {m_name} 训练成功，耗时 {train_time:.2f}s")
+                except Exception as ex:
+                    err_msg = str(ex)
+                    self.log_signal.emit(f"模型 {m_name} 训练失败: {err_msg}")
+                    self.log_signal.emit(traceback.format_exc())
+                    results[m_name] = {
+                        'pipeline': None,
+                        'metrics': {'状态': f'失败: {err_msg[:30]}', '训练时间': 0}
+                    }
+
+                self.progress_signal.emit(int((idx + 1) / total_models * 100))
+
+            output_data = {
+                'results': results,
+                'best_model_name': best_model_name,
+                'best_pipeline': best_pipeline,
+                'problem_type': problem_type,
+                'X_test': X_test,
+                'y_test': y_test
+            }
+            self.finished_signal.emit(output_data)
+        except Exception as e:
+            self.error_signal.emit(f"训练流程全局异常: {str(e)}\n{traceback.format_exc()}")
+
+    def get_model_instance(self, name, problem_type, seed):
+        if problem_type == '回归':
+            if name == 'LinearRegression': return LinearRegression()
+            elif name == 'RandomForest': return RandomForestRegressor(random_state=seed)
+            elif name == 'GradientBoosting': return GradientBoostingRegressor(random_state=seed)
+            elif name == 'XGBoost': return xgb.XGBRegressor(random_state=seed) if HAS_XGBOOST else None
+            elif name == 'LightGBM': return lgb.LGBMRegressor(random_state=seed, verbose=-1) if HAS_LIGHTGBM else None
+            elif name == 'CatBoost': return cb.CatBoostRegressor(random_state=seed, verbose=0) if HAS_CATBOOST else None
+            elif name == 'SGD': return SGDRegressor(random_state=seed)
+        else:
+            if name == 'LogisticRegression': return LogisticRegression(random_state=seed, max_iter=1000)
+            elif name == 'RandomForest': return RandomForestClassifier(random_state=seed)
+            elif name == 'GradientBoosting': return GradientBoostingClassifier(random_state=seed)
+            elif name == 'XGBoost': return xgb.XGBClassifier(random_state=seed) if HAS_XGBOOST else None
+            elif name == 'LightGBM': return lgb.LGBMClassifier(random_state=seed, verbose=-1) if HAS_LIGHTGBM else None
+            elif name == 'CatBoost': return cb.CatBoostClassifier(random_state=seed, verbose=0) if HAS_CATBOOST else None
+            elif name == 'SGD': return SGDClassifier(random_state=seed)
+        return None
+
+    def evaluate_metrics(self, y_true, y_pred, pipeline, X_test, problem_type):
+        metrics = {}
+        y_true_arr = np.array(y_true)
+        if problem_type == '回归':
+            metrics['MAE'] = round(mean_absolute_error(y_true_arr, y_pred), 4)
+            metrics['MSE'] = round(mean_squared_error(y_true_arr, y_pred), 4)
+            metrics['RMSE'] = round(np.sqrt(metrics['MSE']), 4)
+            metrics['R²'] = round(r2_score(y_true_arr, y_pred), 4)
+            metrics['解释方差'] = round(explained_variance_score(y_true_arr, y_pred), 4)
+            
+            diff = y_pred - y_true_arr
+            metrics['MBE'] = round(np.mean(diff), 4)
+            metrics['MBE%'] = round(np.mean(diff / (np.abs(y_true_arr) + 1e-9)) * 100, 2)
+            
+            nonzero_mask = y_true_arr != 0
+            if np.any(nonzero_mask):
+                nz_true = y_true_arr[nonzero_mask]
+                nz_pred = y_pred[nonzero_mask]
+                metrics['MAPE%'] = round(np.mean(np.abs((nz_true - nz_pred) / nz_true)) * 100, 2)
+                rel_err = np.abs(nz_true - nz_pred) / np.abs(nz_true)
+                metrics['WER0.5%'] = round(np.mean(rel_err <= 0.005) * 100, 2)
+                metrics['最大相对误差%'] = round(np.max(rel_err) * 100, 2)
+            else:
+                metrics['MAPE%'] = 0.0
+                metrics['WER0.5%'] = 0.0
+                metrics['最大相对误差%'] = 0.0
+        else:
+            metrics['准确率'] = round(accuracy_score(y_true_arr, y_pred), 4)
+            metrics['精确率'] = round(precision_score(y_true_arr, y_pred, average='macro', zero_division=0), 4)
+            metrics['召回率'] = round(recall_score(y_true_arr, y_pred, average='macro', zero_division=0), 4)
+            metrics['F1'] = round(f1_score(y_true_arr, y_pred, average='macro', zero_division=0), 4)
+            
+            try:
+                if hasattr(pipeline, "predict_proba"):
+                    proba = pipeline.predict_proba(X_test)
+                    if proba.shape[1] == 2:
+                        metrics['ROC_AUC'] = round(roc_auc_score(y_true_arr, proba[:, 1]), 4)
+                    else:
+                        metrics['ROC_AUC'] = round(roc_auc_score(y_true_arr, proba, multi_class='ovr', average='macro'), 4)
+                else:
+                    metrics['ROC_AUC'] = 0.0
+            except Exception:
+                metrics['ROC_AUC'] = 0.0
+        return metrics
+
+    def extract_feature_importance(self, pipeline, feature_cols):
+        importances = []
+        try:
+            model = pipeline.named_steps['model']
+            if hasattr(model, 'feature_importances_'):
+                imp = model.feature_importances_
+                for name, val in zip(feature_cols, imp[:len(feature_cols)]):
+                    importances.append({'feature': name, 'importance': float(val)})
+            elif hasattr(model, 'coef_'):
+                coef = model.coef_
+                if coef.ndim > 1:
+                    coef = np.mean(np.abs(coef), axis=0)
+                else:
+                    coef = np.abs(coef)
+                for name, val in zip(feature_cols, coef[:len(feature_cols)]):
+                    importances.append({'feature': name, 'importance': float(val)})
+            importances = sorted(importances, key=lambda x: abs(x['importance']), reverse=True)
+        except Exception:
+            pass
+        return importances
+
+    def generate_charts(self, pipeline, X_test, y_test, y_pred, model_name, problem_type, output_dir):
+        chart_paths = {}
+        try:
+            plt.figure(figsize=(6, 5))
+            if problem_type == '回归':
+                plt.scatter(y_test, y_pred, alpha=0.6, color='b')
+                plt.plot([y_test.min(), y_test.max()], [y_test.min(), y_test.max()], 'r--', lw=2)
+                plt.xlabel('真实值')
+                plt.ylabel('预测值')
+                plt.title(f'{model_name} - 真实值 vs 预测值')
+                p1 = os.path.join(output_dir, f'{model_name}_scatter.png')
+                plt.savefig(p1, bbox_inches='tight')
+                plt.close()
+                chart_paths['散点图'] = p1
+
+                plt.figure(figsize=(6, 5))
+                residuals = y_test - y_pred
+                plt.hist(residuals, bins=30, color='g', alpha=0.7)
+                plt.xlabel('残差')
+                plt.ylabel('频数')
+                plt.title(f'{model_name} - 残差分布图')
+                p2 = os.path.join(output_dir, f'{model_name}_residual.png')
+                plt.savefig(p2, bbox_inches='tight')
+                plt.close()
+                chart_paths['残差图'] = p2
+            else:
+                plt.figure(figsize=(6, 5))
+                cm = confusion_matrix(y_test, y_pred)
+                plt.imshow(cm, interpolation='nearest', cmap=plt.cm.Blues)
+                plt.title(f'{model_name} - 混淆矩阵')
+                plt.colorbar()
+                plt.xlabel('预测标签')
+                plt.ylabel('真实标签')
+                p1 = os.path.join(output_dir, f'{model_name}_cm.png')
+                plt.savefig(p1, bbox_inches='tight')
+                plt.close()
+                chart_paths['混淆矩阵'] = p1
+        except Exception as e:
+            print(f"生成图表异常: {e}")
+        return chart_paths
+
+
+# ==========================================
+# 3. 主窗口与图形界面实现
+# ==========================================
+class MainWindow(QMainWindow):
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle("机器学习基础建模搭建平台")
+        self.resize(1300, 850)
+
+        # 核心数据状态
+        self.df = None
+        self.file_path = ""
+        self.is_big_data = False
+        self.training_results = {}
+        self.best_model_name = None
+        self.best_pipeline = None
+        self.output_dir = os.path.join(os.getcwd(), f"output_report_{int(time.time())}")
+
+        self.init_ui()
+
+    def init_ui(self):
+        main_layout = QHBoxLayout()
+        
+        # 左右分栏：左侧配置面板，右侧展示Tab
+        splitter = QSplitter(Qt.Horizontal)
+        
+        left_widget = QWidget()
+        left_layout = QVBoxLayout(left_widget)
+        
+        # 1. 数据加载与操作区
+        data_group = QGroupBox("1. 数据加载与操作")
+        data_layout = QVBoxLayout()
+        
+        self.btn_load = QPushButton("加载 CSV/Excel 数据")
+        self.btn_load.clicked.connect(self.load_data_file)
+        data_layout.addWidget(self.btn_load)
+
+        self.btn_load_chunk = QPushButton("加载大文件(分块)")
+        self.btn_load_chunk.clicked.connect(self.load_big_data_file)
+        data_layout.addWidget(self.btn_load_chunk)
+
+        self.btn_sample = QPushButton("生成示例数据")
+        self.btn_sample.clicked.connect(self.generate_sample_data)
+        data_layout.addWidget(self.btn_sample)
+        
+        self.lbl_data_info = QLabel("数据状态: 未加载")
+        data_layout.addWidget(self.lbl_data_info)
+        data_group.setLayout(data_layout)
+        left_layout.addWidget(data_group)
+
+        # 2. 训练配置区
+        config_group = QGroupBox("2. 训练配置与预处理")
+        config_layout = QVBoxLayout()
+
+        config_layout.addWidget(QLabel("目标变量:"))
+        self.combo_target = QComboBox()
+        config_layout.addWidget(self.combo_target)
+
+        config_layout.addWidget(QLabel("特征列 (可多选):"))
+        self.list_features = QListWidget()
+        self.list_features.setSelectionMode(QAbstractItemView.MultiSelection)
+        config_layout.addWidget(self.list_features)
+
+        config_layout.addWidget(QLabel("问题类型:"))
+        self.combo_problem_type = QComboBox()
+        self.combo_problem_type.addItems(["自动检测", "回归", "分类"])
+        config_layout.addWidget(self.combo_problem_type)
+
+        config_layout.addWidget(QLabel("预处理配置:"))
+        self.chk_impute = QCheckBox("填补缺失值")
+        self.chk_impute.setChecked(True)
+        config_layout.addWidget(self.chk_impute)
+
+        scale_layout = QHBoxLayout()
+        scale_layout.addWidget(QLabel("缩放:"))
+        self.combo_scale = QComboBox()
+        self.combo_scale.addItems(["StandardScaler", "MinMaxScaler", "RobustScaler", "PowerTransformer", "无"])
+        scale_layout.addWidget(self.combo_scale)
+        config_layout.addLayout(scale_layout)
+
+        encoder_layout = QHBoxLayout()
+        encoder_layout.addWidget(QLabel("类别编码:"))
+        self.combo_encoder = QComboBox()
+        self.combo_encoder.addItems(["独热编码", "序数编码", "目标编码"])
+        encoder_layout.addWidget(self.combo_encoder)
+        config_layout.addLayout(encoder_layout)
+
+        config_group.setLayout(config_layout)
+        left_layout.addWidget(config_group)
+
+        # 3. 模型选择与执行区
+        model_group = QGroupBox("3. 模型选择与控制")
+        model_layout = QVBoxLayout()
+        
+        self.model_checks = {}
+        model_list = ['RandomForest', 'LogisticRegression', 'XGBoost', 'LinearRegression', 'GradientBoosting', 'LightGBM', 'CatBoost', 'SGD']
+        for m in model_list:
+            chk = QCheckBox(m)
+            if m in ['RandomForest', 'LogisticRegression', 'XGBoost']:
+                chk.setChecked(True)
+            self.model_checks[m] = chk
+            model_layout.addWidget(chk)
+
+        btn_layout = QHBoxLayout()
+        self.btn_train = QPushButton("开始训练/对比")
+        self.btn_train.clicked.connect(self.start_training)
+        self.btn_cancel = QPushButton("取消训练")
+        self.btn_cancel.setEnabled(False)
+        self.btn_cancel.clicked.connect(self.cancel_training)
+        btn_layout.addWidget(self.btn_train)
+        btn_layout.addWidget(self.btn_cancel)
+        model_layout.addLayout(btn_layout)
+
+        self.progress_bar = QProgressBar()
+        self.progress_bar.setValue(0)
+        model_layout.addWidget(self.progress_bar)
+
+        model_group.setLayout(model_layout)
+        left_layout.addWidget(model_group)
+
+        # 4. 后续操作区
+        action_group = QGroupBox("4. 模型持久化与预测")
+        action_layout = QVBoxLayout()
+        
+        self.btn_save_model = QPushButton("保存最佳模型")
+        self.btn_save_model.clicked.connect(self.save_best_model)
+        action_layout.addWidget(self.btn_save_model)
+
+        self.btn_load_model = QPushButton("加载已保存模型")
+        self.btn_load_model.clicked.connect(self.load_external_model)
+        action_layout.addWidget(self.btn_load_model)
+
+        self.btn_batch_pred = QPushButton("批量预测")
+        self.btn_batch_pred.setEnabled(False)
+        self.btn_batch_pred.clicked.connect(self.batch_predict)
+        action_layout.addWidget(self.btn_batch_pred)
+
+        self.btn_export_report = QPushButton("导出报告")
+        self.btn_export_report.setEnabled(False)
+        self.btn_export_report.clicked.connect(self.export_report)
+        action_layout.addWidget(self.btn_export_report)
+
+        action_group.setLayout(action_layout)
+        left_layout.addWidget(action_group)
+
+        left_widget.setLayout(left_layout)
+        splitter.addWidget(left_widget)
+
+        # 右侧选项卡展示区
+        right_tab = QTabWidget()
+        
+        self.table_preview = QTableWidget()
+        right_tab.addTab(self.table_preview, "数据预览")
+
+        self.table_summary = QTableWidget()
+        right_tab.addTab(self.table_summary, "结果汇总")
+
+        self.table_importance = QTableWidget()
+        right_tab.addTab(self.table_importance, "特征重要性")
+
+        self.text_detail = QTextEdit()
+        self.text_detail.setReadOnly(True)
+        right_tab.addTab(self.text_detail, "模型详情")
+
+        self.text_log = QTextEdit()
+        self.text_log.setReadOnly(True)
+        right_tab.addTab(self.text_log, "训练日志")
+
+        splitter.addWidget(right_tab)
+        splitter.setSizes([450, 850])
+
+        main_layout.addWidget(splitter)
+        self.setCentralWidget(QWidget())
+        self.centralWidget().setLayout(main_layout)
+
+    def log(self, message):
+        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        self.text_log.append(f"[{timestamp}] {message}")
+
+    def load_data_file(self):
+        file_path, _ = QFileDialog.getOpenFileName(self, "选择数据文件", "", "CSV/Excel Files (*.csv *.xlsx *.xls);;All Files (*)")
+        if file_path:
+            try:
+                df, enc, sep = DataLoaderEngine.load_file(file_path)
+                self.df = df
+                self.file_path = file_path
+                self.is_big_data = len(df) > 100000
+                self.log(f"成功加载文件: {file_path}, 编码: {enc}, 分隔符: {sep}, 行数: {len(df)}, 列数: {len(df.columns)}")
+                self.update_data_ui()
+            except Exception as e:
+                QMessageBox.critical(self, "加载失败", f"文件解析出错:\n{str(e)}")
+                self.log(f"文件加载失败: {str(e)}")
+
+    def load_big_data_file(self):
+        file_path, _ = QFileDialog.getOpenFileName(self, "选择大文件", "", "CSV Files (*.csv);;All Files (*)")
+        if file_path:
+            try:
+                chunk_list = []
+                chunk_size = 50000
+                total_rows = 0
+                for chunk in pd.read_csv(file_path, chunksize=chunk_size, low_memory=False):
+                    chunk_list.append(chunk)
+                    total_rows += len(chunk)
+                    self.log(f"已加载分块行数: {total_rows}")
+                self.df = pd.concat(chunk_list, ignore_index=True)
+                self.file_path = file_path
+                self.is_big_data = True
+                self.log(f"大文件分块加载完毕，总行数: {len(self.df)}")
+                self.update_data_ui()
+            except Exception as e:
+                QMessageBox.critical(self, "大文件加载失败", str(e))
+
+    def generate_sample_data(self):
+        np.random.seed(42)
+        n = 5000
+        data = {
+            '年龄': np.random.randint(18, 70, n),
+            '使用时长': np.random.exponential(10, n),
+            '温度': np.random.normal(25, 5, n),
+            '是否高峰': np.random.choice([0, 1], n, p=[0.7, 0.3]),
+            '区域': np.random.choice(['华东', '华南', '华北', '西南'], n),
+            '容量': np.random.normal(100, 15, n)
+        }
+        df = pd.DataFrame(data)
+        # 引入 2% 缺失值
+        for col in ['年龄', '温度', '容量']:
+            mask = np.random.rand(n) < 0.02
+            df.loc[mask, col] = np.nan
+
+        self.df = df
+        self.file_path = "sample_data.csv"
+        self.is_big_data = False
+        self.log("成功生成 5000 行示例数据集")
+        self.update_data_ui()
+        # 默认选中容量
+        idx = self.combo_target.findText("容量")
+        if idx >= 0:
+            self.combo_target.setCurrentIndex(idx)
+
+    def update_data_ui(self):
+        if self.df is None:
+            return
+        rows, cols = self.df.shape
+        mem_usage = self.df.memory_usage(deep=True).sum()
+        mem_str = f"{mem_usage / 1024 / 1024:.2f} MB" if mem_usage > 1024*1024 else f"{mem_usage / 1024:.2f} KB"
+        
+        status_text = f"数据量: {rows}行 × {cols}列 | 内存: {mem_str}"
+        if self.is_big_data:
+            status_text += " [大数据集模式]"
+        self.lbl_data_info.setText(status_text)
+
+        # 更新目标变量与特征列
+        self.combo_target.clear()
+        self.combo_target.addItems(self.df.columns.tolist())
+        if len(self.df.columns) > 0:
+            self.combo_target.setCurrentIndex(len(self.df.columns) - 1)
+
+        self.list_features.clear()
+        for col in self.df.columns:
+            self.list_features.addItem(col)
+        # 默认全选特征
+        for i in range(self.list_features.count()):
+            self.list_features.item(i).setSelected(True)
+
+        # 更新表格预览 (前20行)
+        preview_df = self.df.head(20)
+        self.table_preview.setRowCount(len(preview_df))
+        self.table_preview.setColumnCount(len(preview_df.columns))
+        self.table_preview.setHorizontalHeaderLabels(preview_df.columns.tolist())
+        for i in range(len(preview_df)):
+            for j, col in enumerate(preview_df.columns):
+                val = str(preview_df.iloc[i, j])
+                self.table_preview.setItem(i, j, QTableWidgetItem(val))
+
+    def start_training(self):
+        if self.df is None:
+            QMessageBox.warning(self, "警告", "请先加载数据！")
+            return
+        
+        target_col = self.combo_target.currentText()
+        selected_items = self.list_features.selectedItems()
+        feature_cols = [item.text() for item in selected_items]
+
+        if not target_col or not feature_cols:
+            QMessageBox.warning(self, "警告", "必须选择目标变量和至少一个特征列！")
+            return
+
+        if target_col in feature_cols:
+            feature_cols.remove(target_col)
+
+        selected_models = [m for m, chk in self.model_checks.items() if chk.isChecked()]
+        if not selected_models:
+            QMessageBox.warning(self, "警告", "请至少勾选一个模型！")
+            return
+
+        config = {
+            'df': self.df,
+            'target_col': target_col,
+            'feature_cols': feature_cols,
+            'problem_type': self.combo_problem_type.currentText(),
+            'is_big_data': self.is_big_data,
+            'auto_sample': True,
+            'sample_n': 50000,
+            'test_size': 0.2,
+            'seed': 42,
+            'num_impute': 'mean',
+            'scale_method': self.combo_scale.currentText(),
+            'cat_encode': self.combo_encoder.currentText(),
+            'use_smote': False,
+            'models': selected_models,
+            'tune_method': '不调优',
+            'cv_folds': 5,
+            'n_jobs': 1,
+            'param_grids': {},
+            'output_dir': self.output_dir
+        }
+
+        self.btn_train.setEnabled(False)
+        self.btn_cancel.setEnabled(True)
+        self.progress_bar.setValue(0)
+        self.table_summary.clear()
+
+        self.worker = TrainWorker(config)
+        self.worker.log_signal.connect(self.log)
+        self.worker.progress_signal.connect(self.progress_bar.setValue)
+        self.worker.finished_signal.connect(self.training_finished)
+        self.worker.error_signal.connect(self.training_error)
+        self.worker.start()
+
+    def cancel_training(self):
+        if hasattr(self, 'worker'):
+            self.worker.is_cancelled = True
+            self.log("正在请求取消训练...")
+
+    def training_finished(self, output_data):
+        self.btn_train.setEnabled(True)
+        self.btn_cancel.setEnabled(False)
+        self.progress_bar.setValue(100)
+
+        self.training_results = output_data['results']
+        self.best_model_name = output_data['best_model_name']
+        self.best_pipeline = output_data['best_pipeline']
+
+        if self.best_model_name:
+            self.btn_batch_pred.setEnabled(True)
+            self.btn_export_report.setEnabled(True)
+            self.log(f"训练完成！最佳模型: {self.best_model_name}")
+        else:
+            self.log("没有模型成功训练完成。")
+
+        self.update_summary_table()
+        self.update_importance_table()
+        self.update_detail_view()
+        QMessageBox.information(self, "完成", "所有模型训练流程已结束！")
+
+    def training_error(self, err_str):
+        self.btn_train.setEnabled(True)
+        self.btn_cancel.setEnabled(False)
+        self.progress_bar.setValue(0)
+        self.log(err_str)
+        QMessageBox.critical(self, "训练异常", err_str)
+
+    def update_summary_table(self):
+        if not self.training_results:
+            return
+        
+        models = list(self.training_results.keys())
+        first_metrics = self.training_results[models[0]]['metrics']
+        columns = list(first_metrics.keys())
+        # 排除内部字段
+        columns = [c for c in columns if c not in ['feature_importance', 'chart_paths']]
+
+        self.table_summary.setRowCount(len(models))
+        self.table_summary.setColumnCount(len(columns) + 1)
+        self.table_summary.setHorizontalHeaderLabels(['模型名称'] + columns)
+
+        for i, m_name in enumerate(models):
+            self.table_summary.setItem(i, 0, QTableWidgetItem(m_name))
+            m_metrics = self.training_results[m_name]['metrics']
+            for j, col in enumerate(columns):
+                val = str(m_metrics.get(col, 'N/A'))
+                self.table_summary.setItem(i, j + 1, QTableWidgetItem(val))
+
+    def update_importance_table(self):
+        # 寻找第一个带特征重要性的成功模型
+        all_imp = []
+        for m_name, res in self.training_results.items():
+            imp = res['metrics'].get('feature_importance', [])
+            if imp:
+                for item in imp:
+                    all_imp.append({
+                        '模型名称': m_name,
+                        '特征名称': item['feature'],
+                        '重要性': item['importance']
+                    })
+        
+        if not all_imp:
+            return
+
+        self.table_importance.setRowCount(len(all_imp))
+        self.table_importance.setColumnCount(3)
+        self.table_importance.setHorizontalHeaderLabels(['模型名称', '特征名称', '重要性'])
+
+        for i, row in enumerate(all_imp):
+            self.table_importance.setItem(i, 0, QTableWidgetItem(row['模型名称']))
+            self.table_importance.setItem(i, 1, QTableWidgetItem(row['特征名称']))
+            self.table_importance.setItem(i, 2, QTableWidgetItem(str(row['重要性'])))
+
+    def update_detail_view(self):
+        detail_str = "=== 模型训练详情与指标汇总 ===\n\n"
+        for m_name, res in self.training_results.items():
+            detail_str += f"模型: {m_name}\n"
+            for k, v in res['metrics'].items():
+                if k not in ['feature_importance', 'chart_paths']:
+                    detail_str += f"  {k}: {v}\n"
+            detail_str += "\n"
+        self.text_detail.setText(detail_str)
+
+    def save_best_model(self):
+        if self.best_pipeline is None:
+            QMessageBox.warning(self, "警告", "当前没有训练好的最佳模型！")
+            return
+        file_path, _ = QFileDialog.getSaveFileName(self, "保存模型", "best_model.joblib", "Joblib Files (*.joblib)")
+        if file_path:
+            try:
+                joblib.dump(self.best_pipeline, file_path)
+                QMessageBox.information(self, "成功", f"模型已成功保存至:\n{file_path}")
+                self.log(f"最佳模型已保存: {file_path}")
+            except Exception as e:
+                QMessageBox.critical(self, "保存失败", str(e))
+
+    def load_external_model(self):
+        file_path, _ = QFileDialog.getOpenFileName(self, "加载模型", "", "Joblib Files (*.joblib);;All Files (*)")
+        if file_path:
+            try:
+                self.best_pipeline = joblib.load(file_path)
+                self.btn_batch_pred.setEnabled(True)
+                QMessageBox.information(self, "成功", "模型加载成功！")
+                self.log(f"外部模型加载成功: {file_path}")
+            except Exception as e:
+                QMessageBox.critical(self, "加载失败", str(e))
+
+    def batch_predict(self):
+        if self.best_pipeline is None:
+            QMessageBox.warning(self, "警告", "请先训练或加载模型！")
+            return
+        
+        file_path, _ = QFileDialog.getOpenFileName(self, "选择预测文件", "", "CSV/Excel Files (*.csv *.xlsx *.xls)")
+        if file_path:
+            try:
+                pred_df, _, _ = DataLoaderEngine.load_file(file_path)
+                # 预测
+                preds = self.best_pipeline.predict(pred_df)
+                pred_df['预测结果'] = preds
+
+                out_csv = file_path + "_predicted.csv"
+                pred_df.to_csv(out_csv, index=False, encoding='utf-8-sig')
+                self.log(f"批量预测完成，结果已导出至: {out_csv}")
+                QMessageBox.information(self, "成功", f"预测完成！\n结果文件已保存至:\n{out_csv}")
+            except Exception as e:
+                QMessageBox.critical(self, "批量预测异常", str(e))
+
+    def export_report(self):
+        if not self.training_results:
+            QMessageBox.warning(self, "警告", "没有可导出的训练结果！")
+            return
+        
+        dir_path = QFileDialog.getExistingDirectory(self, "选择报告保存目录")
+        if dir_path:
+            try:
+                summary_data = []
+                for m_name, res in self.training_results.items():
+                    m_metrics = res['metrics'].copy()
+                    m_metrics.pop('feature_importance', None)
+                    m_metrics.pop('chart_paths', None)
+                    m_metrics['模型名称'] = m_name
+                    summary_data.append(m_metrics)
+                    
+                    # 保存单个模型
+                    if res['pipeline'] is not None:
+                        joblib.dump(res['pipeline'], os.path.join(dir_path, f"{m_name}_model.joblib"))
+
+                sum_df = pd.DataFrame(summary_data)
+                sum_df.to_csv(os.path.join(dir_path, "model_summary.csv"), index=False, encoding='utf-8-sig')
+
+                # 生成简单 HTML 报告
+                html_content = f"""
+                <html>
+                <head><meta charset="utf-8"><title>机器学习建模报告</title></head>
+                <body>
+                <h1>机器学习基础建模平台 - 训练报告</h1>
+                <p>生成时间: {datetime.now().strftime("%Y-%m-%d %H:%M:%S")}</p>
+                <h2>模型汇总指标</h2>
+                {sum_df.to_html(index=False)}
+                </body>
+                </html>
+                """
+                with open(os.path.join(dir_path, "report.html"), "w", encoding="utf-8") as f:
+                    f.write(html_content)
+
+                QMessageBox.information(self, "成功", f"完整报告与模型已导出至:\n{dir_path}")
+                self.log(f"导出报告成功: {dir_path}")
+            except Exception as e:
+                QMessageBox.critical(self, "导出异常", str(e))
+
+
+if __name__ == '__main__':
+    app = QApplication(sys.argv)
+    window = MainWindow()
+    window.show()
+    sys.exit(app.exec_())
 
